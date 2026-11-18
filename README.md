@@ -25,6 +25,10 @@
 | 响应逐块转发、不整份缓存 | `upstream.content.iter_chunked(RELAY_CHUNK_SIZE)` 逐块 `send`；有测试断言首字节在整份响应结束前很早就到达客户端 |
 | 慢探活不挡切换/查询 | 探活是独立任务，`POST /api/switch` 默认立刻返回 202（`wait=true` 才阻塞，且可设超时）；`/api/status` 是纯同步快照，不取锁、不 await 任何网络 |
 | 慢下载不挡切换/查询 | 探活与代理使用**两个独立的 aiohttp session/连接池**；控制面不等待任何下载 |
+| 竞速补发（hedged download） | `POST /api/hedged-download`，body `{"path": "/artifact?…"}`：受理时向当前目标发完整 GET；**首路 300ms（`RELAY_HEDGE_DELAY_SECONDS`）没回响应头**才向同一目标补发一路完全相同的 GET。只转发最先返回 **200** 的一路；另一路取消并 `close()` 释放连接。两路都失败 → 502/504，绝不下发成功文件 |
+| 300ms 内已回任何状态 | 首路在窗口内返回（含 4xx/5xx）即按普通 GET 原样转发，不发第二路（响应头 `x-relay-hedged: false`） |
+| 发出响应头后不换源、不拼接 | 赢家在发送**第一个字节之前**确定；随后正文只来自这一路，逐块转发。兄弟请求在此时已被取消并释放，不可能混入字节 |
+| 竞速不阻塞切换/状态查询 | 两路 GET 与普通下载共用上游连接池（与探活池独立），登记为该代的**一条**在途记录；drain 到期或客户端断连会同时中止两路 |
 | `/docs` 可切换、查目标与各代在途数 | OpenAPI 见 `/docs`；`GET /api/status` 返回当前目标/代、各代状态与 `in_flight`、进行中的请求明细；`/demo` 是可视化演示页 |
 
 补充约定：
@@ -36,6 +40,11 @@
 * 只代理 GET/HEAD；WebSocket / `CONNECT` 不支持。上游返回的 3xx `Location` 原样透传
   （不重写 Location，所以跨代的绝对跳转不会自动改写到新目标）。
 * 切流不重放任何请求：已经发出并失败的请求不会被自动重试，由客户端自行重试。
+  （`POST /api/hedged-download` 是唯一的显式补发入口，且两路都打向受理时的同一目标。）
+* 上游演示源支持两种响应头延迟：`GET /artifact?header_delay=1` 对**每次**请求都延迟；
+  `POST /_control/first-hit?path=/artifact?…&delay=1[&status=503][&count=2]` 只让接下来
+  1 次（或 `count` 次）匹配该路径的请求慢/失败，之后立即恢复——这是演示竞速补发的关键，
+  因为代理两路请求的 URL 完全相同，靠请求内参数无法只拖慢第一路。
 
 ## 运行（Docker Compose）
 
@@ -78,6 +87,19 @@ curl http://localhost:8080/api/status | python3 -m json.tool
 脚本读 `RELAY` 环境变量，默认 `http://localhost:8080`（本地手跑时用
 `RELAY=http://127.0.0.1:<port> ./demo/download.sh`）。
 
+竞速下载演示：
+
+```bash
+./demo/hedged-download.sh
+```
+
+它先在**当前上游**调用 `POST /_control/first-hit`，让该上游的下一次 `GET /artifact`
+在响应头前等 1 秒（再下一次同路径请求立即响应），然后调用
+`POST /api/hedged-download`：首路 300ms 没回头 → 补发第二路 → 第二路先回 200，
+约 300ms 即开始收正文（而不是 1 秒），响应头里 `x-relay-hedged: true`、
+`x-relay-hedge-attempt: 2`，落盘文件完整为 1 MiB。也可以在 `/demo` 页面点两个按钮、
+或在 `/docs` 里直接调用新接口。
+
 ### 手动跑两个可控上游（不用 docker）
 
 ```bash
@@ -101,6 +123,7 @@ RELAY_TARGETS='blue=http://127.0.0.1:9001,green=http://127.0.0.1:9002' \
 | `RELAY_CONNECT_TIMEOUT` | `5` | 上游连接超时 |
 | `RELAY_SOCK_READ_TIMEOUT` | `0` | 上游读超时，0=不限（慢下载需要） |
 | `RELAY_CHUNK_SIZE` | `65536` | 转发块大小（不缓冲整份响应） |
+| `RELAY_HEDGE_DELAY_SECONDS` | `0.3` | hedged-download 首路等待响应头的毫秒阈值；超时未回才补发第二路，必须 > 0 |
 | `RELAY_HOST` / `RELAY_PORT` | `0.0.0.0` / `8080` | 监听地址 |
 | `RELAY_SHUTDOWN_GRACE_SECONDS` | `5` | 退出时等长下载收尾的上限，超时后强制断开并 abort 所有代 |
 | `RELAY_MAX_CLOSED_GENERATIONS` | `100` | 状态里保留的已关闭代数（活跃/收尾中的代永远不会被裁掉） |
@@ -116,6 +139,21 @@ RELAY_TARGETS='blue=http://127.0.0.1:9001,green=http://127.0.0.1:9002' \
   `in_flight_requests[]`）、`recent_operations[]`（最近 50 次）。
 * `GET /api/operations/{id}` — 单次切换的最终状态。
 * `GET /api/targets` — 目标表 + 当前目标。
+* `POST /api/hedged-download` — body `{"path": "/artifact?bytes=1048576"}`，`path` 必须以
+  `/` 开头、可带查询串，不接受绝对 URL（校验失败 → 422）。行为：
+  1. 受理时固定当前代，向 `目标 base_url + path` 发一路完整 GET（与普通代理同样剥离
+     hop-by-hop/host/content-length 头）；
+  2. 若首路在 `RELAY_HEDGE_DELAY_SECONDS`（默认 0.3s）内返回**任意**响应头 → 按普通 GET
+     处理（原样转发该状态码与正文，响应头带 `x-relay-hedged: false`、
+     `x-relay-hedge-attempt: 1`），不补发；
+  3. 超时未回头才向**同一目标**补发第二路相同 GET；进入双路阶段后，只有最先返回 **200**
+     的一路会被转发（`x-relay-hedged: true`，`x-relay-hedge-attempt` 标明赢的是第几路）；
+     非 200 的一路其连接被关闭释放；两路都非 200 时把失败状态码作为普通响应返回，两路
+     都连不上/超时则返回 502/504 JSON —— **任何失败路径都不会下发 200 文件**；
+  4. 首路在等待期内直接连接失败时，不等满 300ms，立即补发第二路；
+  5. 响应头一旦发给客户端，赢家固定：正文逐块只来自这一路，不换源、不拼接；
+  6. 两路共享一条在途登记，旧代 5 秒 drain 到期或客户端断连时两路一起取消，连接释放后
+     再清除在途登记（`/api/status` 不会提前报零）。
 
 ## 设计要点（为什么这么做）
 
@@ -141,4 +179,7 @@ python -m pytest -q
 
 `tests/` 分两层：`test_switch_unit.py` 用假探活 session 覆盖状态机（失败保留、supersede、
 迟到 200、drain 只作用于本代、回切同址、no-op）；`test_proxy_integration.py` 起真实
-TCP 上游 + relay，覆盖逐块转发、长连接重路由、在途计数、5 秒截断、502/404、断开清理等。
+TCP 上游 + relay，覆盖逐块转发、长连接重路由、在途计数、5 秒截断、502/404、断开清理等；
+`test_hedged_download.py` 覆盖竞速补发：窗口内不补发、慢头补发且第二路获胜、窗口内任意
+状态按普通 GET、双路非 200/双路连不上必返回失败、查询串原样、drain 与客户端断连中止两路、
+正文期截断不拼源、慢回源不挡状态/切换、OpenAPI 可见。

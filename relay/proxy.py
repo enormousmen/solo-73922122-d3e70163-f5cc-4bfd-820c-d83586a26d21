@@ -6,11 +6,12 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager, suppress
 from typing import Iterable
+from urllib.parse import urlsplit
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.types import Receive, Scope, Send
 
 from .config import Config
@@ -68,6 +69,29 @@ class SwitchRequest(BaseModel):
     wait_timeout: float = Field(30.0, gt=0, le=30.0, description="Max seconds to wait")
 
 
+class HedgedDownloadRequest(BaseModel):
+    path: str = Field(
+        ...,
+        description=(
+            "Artifact path relative to the current target, e.g. "
+            "'/artifact?bytes=1048576'. Must start with '/' and may carry a query string."
+        ),
+        min_length=1,
+    )
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, value: str) -> str:
+        if not value.startswith("/"):
+            raise ValueError("path must start with '/' and be relative to the target")
+        parts = urlsplit(value)
+        if parts.scheme or parts.netloc:
+            raise ValueError("absolute URLs are not allowed; give a relative path")
+        if any(ch.isspace() for ch in value):
+            raise ValueError("path must not contain whitespace")
+        return value
+
+
 class RelayApp:
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -118,7 +142,13 @@ class RelayApp:
                 "`RELAY_DRAIN_SECONDS` (default 5s); when the window expires only that "
                 "generation's unfinished requests are interrupted. Requests on newer "
                 "generations are untouched.\n"
-                "* Response bodies are forwarded chunk by chunk, never buffered whole.\n\n"
+                "* Response bodies are forwarded chunk by chunk, never buffered whole.\n"
+                "* `POST /api/hedged-download` sends a full GET to the target accepted at "
+                "request time. If the first attempt has not returned response headers after "
+                "`RELAY_HEDGE_DELAY_SECONDS` (default 0.3s), one second attempt is sent to "
+                "the same target. Only the first attempt to return **200** is streamed; the "
+                "other is cancelled and its connection released. If neither attempt can "
+                "produce a success the client gets a failure response, never a success file.\n\n"
                 "Open **GET /demo** for a click-through download demo."
             ),
             lifespan=self.lifespan,
@@ -126,6 +156,7 @@ class RelayApp:
         app.get("/api/status", tags=["relay"])(self.api_status)
         app.get("/api/targets", tags=["relay"])(self.api_targets)
         app.post("/api/switch", tags=["relay"])(self.api_switch)
+        app.post("/api/hedged-download", tags=["relay"])(self.api_hedged_download)
         app.get("/api/operations/{operation_id}", tags=["relay"])(self.api_operation)
         app.get("/demo", response_class=HTMLResponse, tags=["demo"])(self.demo_page)
         app.get("/", response_class=HTMLResponse, tags=["demo"])(self.demo_page)
@@ -236,22 +267,8 @@ class RelayApp:
             except asyncio.CancelledError:
                 raise
 
-            response_headers = [
-                (k, v)
-                for k, v in _strip_hop_by_hop(list(upstream_response.headers.items()))
-                if k.lower() not in DROP_RESPONSE_HEADERS and not k.lower().startswith("x-relay-")
-            ]
-            # Body framing is ours. If upstream declared a length we pass it on
-            # (bytes are relayed verbatim because decompression is disabled).
-            length = upstream_response.headers.get("Content-Length")
-            if length is not None and upstream_response.status not in (204, 304):
-                response_headers.append(("content-length", length))
-            response_headers.extend(
-                [
-                    ("x-relay-target", generation.target_name),
-                    ("x-relay-generation", str(generation.id)),
-                    ("x-relay-request-id", str(in_flight.id)),
-                ]
+            response_headers = self._upstream_response_headers(
+                upstream_response, generation, in_flight.id, extra_headers=None
             )
             response = StreamingUpstreamResponse(
                 relay=self,
@@ -277,6 +294,304 @@ class RelayApp:
                     await disconnect_task
                 abort_wait.cancel()
                 generation.unregister(in_flight)
+
+    def _upstream_response_headers(
+        self,
+        upstream_response: aiohttp.ClientResponse,
+        generation: Generation,
+        request_id: int,
+        extra_headers: list[tuple[str, str]] | None,
+    ) -> list[tuple[str, str]]:
+        response_headers = [
+            (k, v)
+            for k, v in _strip_hop_by_hop(list(upstream_response.headers.items()))
+            if k.lower() not in DROP_RESPONSE_HEADERS and not k.lower().startswith("x-relay-")
+        ]
+        # Body framing is ours. If upstream declared a length we pass it on
+        # (bytes are relayed verbatim because decompression is disabled).
+        length = upstream_response.headers.get("Content-Length")
+        if length is not None and upstream_response.status not in (204, 304):
+            response_headers.append(("content-length", length))
+        response_headers.extend(
+            [
+                ("x-relay-target", generation.target_name),
+                ("x-relay-generation", str(generation.id)),
+                ("x-relay-request-id", str(request_id)),
+            ]
+        )
+        if extra_headers:
+            response_headers.extend(extra_headers)
+        return response_headers
+
+    # -- hedged download ----------------------------------------------------
+    async def api_hedged_download(
+        self, body: HedgedDownloadRequest, request: Request
+    ) -> Response:
+        """Hedged GET: a second identical attempt goes out only when the first
+        attempt has not produced response headers within the hedge delay.
+
+        Both attempts are full GETs pinned to the generation that was current
+        when this request was accepted, and they share one in-flight slot on
+        that generation, so a single drain expiry or client disconnect aborts
+        both.  Once response headers are sent to the client the winner is fixed
+        for the whole body: no source switching and no byte splicing.
+        """
+        # Same accept-time pinning discipline as proxy_get: resolve and register
+        # synchronously before the first await.
+        generation = self.state.current
+        in_flight = generation.register(body.path)
+
+        url = generation.base_url + body.path
+        request_headers = [
+            (k, v)
+            for k, v in _strip_hop_by_hop(_header_pairs(request.scope.get("headers", [])))
+            if k.lower() not in ("host", "content-length", "content-type")
+        ]
+
+        disconnect_event = asyncio.Event()
+        disconnect_task = asyncio.create_task(
+            _watch_disconnect(request.receive, disconnect_event),
+            name=f"relay-hedge-disconnect-{in_flight.id}",
+        )
+        abort_wait = asyncio.ensure_future(in_flight.event.wait())
+        disconnect_wait = asyncio.ensure_future(disconnect_event.wait())
+        attempts: list[asyncio.Task[aiohttp.ClientResponse]] = []
+        attempt_numbers: dict[asyncio.Task, int] = {}
+        parked: list[tuple[int, aiohttp.ClientResponse]] = []
+        hedge_task: asyncio.Task | None = None
+        handed_off = False
+        try:
+            first = self._start_hedge_attempt(url, request_headers, in_flight.id, 1)
+            attempts.append(first)
+            attempt_numbers[first] = 1
+            hedge_task = asyncio.create_task(
+                asyncio.sleep(self.config.hedge_delay_seconds),
+                name=f"relay-hedge-timer-{in_flight.id}",
+            )
+            sent_second = False
+
+            while True:
+                if abort_wait.done() or disconnect_event.is_set():
+                    break
+
+                # Poll first: an attempt that finished between loop iterations
+                # (or before the first wait even started) is no longer in the
+                # set handed to ``asyncio.wait`` and would otherwise be missed,
+                # letting the hedge timer fire despite an answer already in hand.
+                task = next((t for t in attempts if t.done()), None)
+                if task is None:
+                    wait_for: set[asyncio.Future] = {abort_wait, disconnect_wait, *attempts}
+                    if hedge_task is not None:
+                        wait_for.add(hedge_task)
+                    done, _ = await asyncio.wait(
+                        wait_for, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if abort_wait.done() or disconnect_event.is_set():
+                        break
+                    if hedge_task is not None and hedge_task in done:
+                        hedge_task = None
+                        if not sent_second:
+                            second = self._start_hedge_attempt(
+                                url, request_headers, in_flight.id, 2
+                            )
+                            attempts.append(second)
+                            attempt_numbers[second] = 2
+                            sent_second = True
+                    continue
+
+                attempt_no = attempt_numbers.pop(task)
+                attempts.remove(task)
+                try:
+                    upstream_response = task.result()
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    log.info(
+                        "hedged request %s attempt %s failed before headers: %s: %s",
+                        in_flight.id,
+                        attempt_no,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    # A failed attempt frees its own connection already; fire the
+                    # hedge at once instead of waiting out the rest of the delay.
+                    if not sent_second and hedge_task is not None:
+                        hedge_task.cancel()
+                        with suppress(BaseException):
+                            await hedge_task
+                        hedge_task = None
+                        second = self._start_hedge_attempt(url, request_headers, in_flight.id, 2)
+                        attempts.append(second)
+                        attempt_numbers[second] = 2
+                        sent_second = True
+                        continue
+                    if not attempts:
+                        status = 504 if isinstance(exc, asyncio.TimeoutError) else 502
+                        return self._error_response(
+                            status,
+                            "upstream_timeout" if status == 504 else "upstream_error",
+                            f"both hedged attempts failed; last error: {type(exc).__name__}: {exc}",
+                            generation,
+                            in_flight,
+                        )
+                    continue
+                except asyncio.CancelledError:
+                    raise
+
+                # Before the hedge delay elapses, *any* response (of any status)
+                # settles the request the way an ordinary GET would.
+                if hedge_task is not None:
+                    hedge_task.cancel()
+                    with suppress(BaseException):
+                        await hedge_task
+                    hedge_task = None
+                    response = await self._hand_off_hedged_response(
+                        upstream_response=(attempt_no, upstream_response),
+                        generation=generation,
+                        in_flight=in_flight,
+                        abort_wait=abort_wait,
+                        disconnect_event=disconnect_event,
+                        disconnect_task=disconnect_task,
+                        disconnect_wait=disconnect_wait,
+                        attempts=attempts,
+                        attempt_numbers=attempt_numbers,
+                        parked=parked,
+                        hedged=False,
+                    )
+                    handed_off = True
+                    return response
+
+                # Two-attempt phase: only the first 200 wins.  A non-200 is
+                # parked so its body/connection can be released after the race.
+                if upstream_response.status == 200:
+                    response = await self._hand_off_hedged_response(
+                        upstream_response=(attempt_no, upstream_response),
+                        generation=generation,
+                        in_flight=in_flight,
+                        abort_wait=abort_wait,
+                        disconnect_event=disconnect_event,
+                        disconnect_task=disconnect_task,
+                        disconnect_wait=disconnect_wait,
+                        attempts=attempts,
+                        attempt_numbers=attempt_numbers,
+                        parked=parked,
+                        hedged=True,
+                    )
+                    handed_off = True
+                    return response
+                parked.append((attempt_no, upstream_response))
+                if not attempts:
+                    # Both attempts answered, neither with 200: surface the first
+                    # parked failure as an ordinary GET would have.  No response
+                    # header has been forwarded yet, so no success file can ever
+                    # be delivered for a failed download.
+                    loser_no, loser = parked.pop(0)
+                    response = await self._hand_off_hedged_response(
+                        upstream_response=(loser_no, loser),
+                        generation=generation,
+                        in_flight=in_flight,
+                        abort_wait=abort_wait,
+                        disconnect_event=disconnect_event,
+                        disconnect_task=disconnect_task,
+                        disconnect_wait=disconnect_wait,
+                        attempts=[],
+                        attempt_numbers=attempt_numbers,
+                        parked=parked,
+                        hedged=True,
+                    )
+                    handed_off = True
+                    return response
+
+            # Aborted (drain/shutdown) or the client went away before any header
+            # was forwarded.  Cancel everything and release connections first;
+            # the in-flight slot is cleared in ``finally`` afterwards.
+            if disconnect_event.is_set():
+                return self._error_response(
+                    499, "client_disconnected", "client went away", generation, in_flight
+                )
+            return self._drain_response(in_flight, generation)
+        finally:
+            if hedge_task is not None:
+                hedge_task.cancel()
+            if not handed_off:
+                for task in attempts:
+                    task.cancel()
+                    with suppress(BaseException):
+                        resp = await task
+                        resp.close()
+                        await resp.wait_for_close()
+                for _, resp in parked:
+                    resp.close()
+                    with suppress(BaseException):
+                        await resp.wait_for_close()
+                disconnect_wait.cancel()
+                disconnect_task.cancel()
+                with suppress(BaseException):
+                    await disconnect_task
+                abort_wait.cancel()
+                # Release upstream connections before clearing the in-flight
+                # registration, so status never reports a freed request early.
+                generation.unregister(in_flight)
+
+    def _start_hedge_attempt(
+        self, url: str, headers: list[tuple[str, str]], request_id: int, attempt_no: int
+    ) -> asyncio.Task:
+        return asyncio.create_task(
+            self.state.upstream_session.request(
+                "GET", url, headers=headers, allow_redirects=False
+            ),
+            name=f"relay-hedge-{request_id}-a{attempt_no}",
+        )
+
+    async def _hand_off_hedged_response(
+        self,
+        *,
+        upstream_response: tuple[int, aiohttp.ClientResponse],
+        generation: Generation,
+        in_flight: InFlightRequest,
+        abort_wait: asyncio.Future,
+        disconnect_event: asyncio.Event,
+        disconnect_task: asyncio.Task,
+        disconnect_wait: asyncio.Future,
+        attempts: list[asyncio.Task],
+        attempt_numbers: dict[asyncio.Task, int],
+        parked: list[tuple[int, aiohttp.ClientResponse]],
+        hedged: bool,
+    ) -> Response:
+        attempt_no, winner = upstream_response
+        # Cancel the still-running sibling and release every parked connection
+        # before a single byte is sent to the client.
+        for task in attempts:
+            task.cancel()
+            attempt_numbers.pop(task, None)
+            with suppress(BaseException):
+                sibling = await task
+                sibling.close()
+                await sibling.wait_for_close()
+        attempts.clear()
+        for _, resp in parked:
+            resp.close()
+            with suppress(BaseException):
+                await resp.wait_for_close()
+        parked.clear()
+
+        extra_headers = [
+            ("x-relay-hedged", "true" if hedged else "false"),
+            ("x-relay-hedge-attempt", str(attempt_no)),
+        ]
+        response_headers = self._upstream_response_headers(
+            winner, generation, in_flight.id, extra_headers
+        )
+        return StreamingUpstreamResponse(
+            relay=self,
+            upstream=winner,
+            in_flight=in_flight,
+            generation=generation,
+            status_code=winner.status,
+            headers=response_headers,
+            abort_wait=abort_wait,
+            disconnect=disconnect_event,
+            disconnect_task=disconnect_task,
+            disconnect_wait=disconnect_wait,
+        )
 
     def _drain_response(self, in_flight: InFlightRequest, generation: Generation) -> JSONResponse:
         return JSONResponse(
@@ -515,6 +830,23 @@ DEMO_HTML = """<!doctype html>
   <code>curl -X POST 'http://localhost:9002/_control/probe?delay=4'</code>.
   Add <code>&amp;status=503</code> to make the probe fail.</p>
 
+<h2>Hedged download demo</h2>
+<p><code>POST /api/hedged-download</code> waits 300&nbsp;ms for response headers, then sends a
+  second identical GET to the <em>same</em> target and streams only the first 200.
+  First arm the current upstream so its first response header is slow, then call the API:</p>
+<pre id="hedge-cmds">curl -X POST 'http://localhost:9001/_control/first-hit?path=/artifact?bytes=1048576&amp;delay=1'
+curl -X POST http://localhost:8080/api/hedged-download \
+  -H 'content-type: application/json' \
+  -d '{"path":"/artifact?bytes=1048576"}' -D - -o /tmp/hedged.bin</pre>
+<div class="row">
+  <button onclick="armHedge()">1. Arm slow first header on current target</button>
+  <button onclick="runHedge()">2. Call hedged-download</button>
+  <span id="hedge-msg" class="muted"></span>
+</div>
+<p class="muted">Expected: response headers arrive in roughly 300&nbsp;ms (not 1&nbsp;s) with
+  <code>x-relay-hedged: true</code> and <code>x-relay-hedge-attempt: 2</code>. The stalled first
+  GET is cancelled and its connection released before any body byte is forwarded.</p>
+
 <script>
 async function refresh() {
   try {
@@ -538,6 +870,32 @@ async function switchTo(target) {
   document.getElementById('switch-msg').textContent = r.status + ' ' + j.operation.status +
     (j.operation.reason ? ' — ' + j.operation.reason : '');
   refresh();
+}
+async function armHedge() {
+  const snap = await (await fetch('/api/status')).json();
+  const port = snap.current.target === 'blue' ? 9001 : 9002;
+  const r = await fetch(`http://localhost:${port}/_control/first-hit` +
+    '?path=/artifact?bytes=1048576&delay=1', {method: 'POST'});
+  document.getElementById('hedge-msg').textContent =
+    `armed on ${snap.current.target} (localhost:${port}): ` + (await r.text());
+}
+async function runHedge() {
+  const t0 = performance.now();
+  let msg;
+  try {
+    const r = await fetch('/api/hedged-download', {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({path: '/artifact?bytes=1048576'})
+    });
+    const ms = Math.round(performance.now() - t0);
+    const buf = await r.arrayBuffer();
+    msg = `HTTP ${r.status} in ${ms} ms, ${buf.byteLength} bytes — ` +
+      `x-relay-hedged=${r.headers.get('x-relay-hedged')}, ` +
+      `attempt=${r.headers.get('x-relay-hedge-attempt')}`;
+  } catch (e) {
+    msg = 'failed: ' + e;
+  }
+  document.getElementById('hedge-msg').textContent = msg;
 }
 refresh();
 setInterval(refresh, 1000);

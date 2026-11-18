@@ -21,6 +21,7 @@ services:
       RELAY_PROBE_PATH: "/ready"
       RELAY_PROBE_TIMEOUT: "2"
       RELAY_DRAIN_SECONDS: "5"
+      RELAY_HEDGE_DELAY_SECONDS: "0.3"
       RELAY_CHUNK_SIZE: "65536"
       RELAY_LOG_LEVEL: "INFO"
     ports:

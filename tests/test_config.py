@@ -8,6 +8,15 @@ def test_defaults():
     assert cfg.initial == "blue"
     assert set(cfg.targets) == {"blue", "green"}
     assert cfg.drain_seconds == 5.0
+    assert cfg.hedge_delay_seconds == 0.3
+
+
+def test_hedge_delay_is_configurable_and_must_be_positive():
+    assert load_config({"RELAY_HEDGE_DELAY_SECONDS": "0.15"}).hedge_delay_seconds == 0.15
+    with pytest.raises(ValueError):
+        load_config({"RELAY_HEDGE_DELAY_SECONDS": "0"})
+    with pytest.raises(ValueError):
+        load_config({"RELAY_HEDGE_DELAY_SECONDS": "-0.1"})
 
 
 def test_json_targets_and_validation():

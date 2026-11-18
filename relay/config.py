@@ -25,6 +25,7 @@ class Config:
     connect_timeout: float
     sock_read_timeout: float
     chunk_size: int
+    hedge_delay_seconds: float
     host: str
     port: int
     max_closed_generations: int = 100
@@ -92,6 +93,9 @@ def load_config(env: dict[str, str] | None = None) -> Config:
     chunk_size = int(e.get("RELAY_CHUNK_SIZE", "65536"))
     if chunk_size <= 0:
         raise ValueError("RELAY_CHUNK_SIZE must be > 0")
+    hedge_delay = _env_float(e, "RELAY_HEDGE_DELAY_SECONDS", 0.3)
+    if hedge_delay <= 0:
+        raise ValueError("RELAY_HEDGE_DELAY_SECONDS must be > 0")
     max_closed = int(e.get("RELAY_MAX_CLOSED_GENERATIONS", "100"))
     if max_closed < 1:
         raise ValueError("RELAY_MAX_CLOSED_GENERATIONS must be >= 1")
@@ -107,6 +111,7 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         connect_timeout=connect_timeout,
         sock_read_timeout=sock_read_timeout,
         chunk_size=chunk_size,
+        hedge_delay_seconds=hedge_delay,
         host=e.get("RELAY_HOST", "0.0.0.0"),
         port=int(e.get("RELAY_PORT", "8080")),
         max_closed_generations=max_closed,
